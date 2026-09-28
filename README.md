@@ -5,8 +5,7 @@
 > 本 README 侧重这台设备本身与 Claude Code 的配置。
 
 小喵掌机（ESP32-WROVER-B + ST7735 160×128）上的 Claude Code 状态显示屏。
-移植自 [safernandez666/vibecoding-traffic-light](https://github.com/safernandez666/vibecoding-traffic-light)，
-硬件框架参照 [jsfaint/tetris-miao](https://github.com/jsfaint/tetris-miao)。
+
 
 掌机屏幕显示当前 Claude 状态：
 
