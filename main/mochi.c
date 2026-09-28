@@ -26,7 +26,6 @@
 #define M_STAR     0xF6D34A     /* 成功星星 */
 #define M_WARN     0xF6D34A     /* ! 警告框 */
 #define M_ZZZ      0xFFF3B0     /* 睡觉 zZ */
-#define M_SHADOW   0x30180C     /* 睡觉地影 */
 
 #define W 160
 #define H 128
@@ -161,7 +160,8 @@ static void draw_z(int x, int y, int w, int h, int thk, lv_color_t c) {
 }
 
 static void prop_sleeping(void) {
-    fill_rect(20, 112, 120, 3, lv_color_hex(M_SHADOW));   /* 地影 */
+    /* 原版这里有一条 120x3 的「地影」横条，在 160x128 的屏上看着就是
+     * 嘴下面突兀一条超长黑杠，删掉。 */
     /* ph 在 0/1 间交替，两个 Z 一起向左上飘，形成 zZ 冒泡的动画 */
     uint32_t ph = (lv_tick_get() / 400) % 2;
     draw_z(118 - ph * 4, 30 - ph * 6, 9, 10, 2, lv_color_hex(M_ZZZ));   /* 小 z */
