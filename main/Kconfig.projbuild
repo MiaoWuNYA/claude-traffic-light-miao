@@ -1,0 +1,32 @@
+menu "Traffic Light Configuration"
+
+    config TRAFFIC_ENABLE_WIFI
+        bool "Enable WiFi + HTTP server + on-screen WiFi setup"
+        default y
+        help
+          Disable for QEMU-only validation builds: QEMU's esp32 machine
+          has no WiFi baseband model, so esp_wifi aborts. In that mode a
+          fake AP list is used so the on-screen setup UI can still be
+          exercised, and the keys drive the traffic light state directly.
+          QEMU serial keys: u d l r a b (uppercase = long press),
+          p = dump the framebuffer as ASCII art.
+
+    config TRAFFIC_ENABLE_BLE
+        bool "Enable the Bluetooth (BLE) link as an alternative to WiFi"
+        depends on TRAFFIC_ENABLE_WIFI
+        default y
+        help
+          NimBLE GATT peripheral exposing the same command set as the HTTP
+          API (rojo / alerta / verde / off / status / task / decision), so
+          the host hook can talk to the console over Bluetooth instead of
+          WiFi. Which of the two is active is chosen on the console itself
+          (settings menu → 连接) and remembered in NVS.
+
+          Depends on TRAFFIC_ENABLE_WIFI purely because that switch already
+          means "real hardware": QEMU's esp32 machine has no Bluetooth
+          controller model either, so this is off in QEMU builds.
+
+          Needs CONFIG_BT_ENABLED and CONFIG_BT_NIMBLE_ENABLED (both set in
+          sdkconfig.defaults).
+
+endmenu

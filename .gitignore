@@ -1,0 +1,20 @@
+# ESP-IDF build output
+build/
+build_qemu/
+sdkconfig
+sdkconfig.old
+
+# Managed components are re-fetched by `idf.py` from dependencies.lock
+managed_components/
+
+# Flash dumps / firmware artifacts (never commit binaries)
+*.bin
+*.deb
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+test/test_link_cmd

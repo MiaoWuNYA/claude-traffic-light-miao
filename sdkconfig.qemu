@@ -1,0 +1,2 @@
+# QEMU 验证专用：无 WiFi（QEMU esp32 机型没有 WiFi 基带外设模型）
+CONFIG_TRAFFIC_ENABLE_WIFI=n

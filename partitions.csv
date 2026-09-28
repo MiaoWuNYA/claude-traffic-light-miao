@@ -1,0 +1,15 @@
+# 小喵掌机实测分区表 —— 与设备出厂固件一致（直接从备份 0x8000 处 dump 出来照抄）
+#
+# 设备本身没有 otadata / ota_0，所以没有 OTA 槽位：
+#   分区表在 0x8000（不是常见的 0x9000），app 直接放 factory
+#   storage 是出厂固件（cyber_pet）的存档区，本固件不用，保留不动
+#
+# 注意：本固件**只烧 app 到 0x10000**，不动设备上的 bootloader / 分区表 / nvs，
+#       所以这张表主要是给编译期对齐用的（IDF 运行时按 sdkconfig 里的
+#       CONFIG_PARTITION_TABLE_OFFSET=0x8000 去 flash 里读真表）。
+
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xF000,   0x1000,
+factory,  app,  factory, 0x10000,  0x200000,
+storage,  data, spiffs,  0x210000, 0x1F0000,
