@@ -33,14 +33,22 @@ static int fails;
 /* ── 假宿主：把动作记下来 ──────────────────────────────────────────── */
 static lc_light_t g_light;
 static int         g_light_n;
+static int         g_last_slot = -1;
 static char        g_task[128];
 static int         g_task_n;
+static char        g_question[128];
 static int         g_dec_timeout = -1;
+static int         g_dec_slot    = -1;
 static lc_dec_t    g_dec_reply   = LC_DEC_NONE;
 
-static void host_set_light(lc_light_t st) { g_light = st; g_light_n++; }
-static void host_set_task(const char *txt) { snprintf(g_task, sizeof g_task, "%s", txt); g_task_n++; }
-static lc_dec_t host_wait_decision(int t) { g_dec_timeout = t; return g_dec_reply; }
+static void host_set_light(int slot, lc_light_t st) { g_light = st; g_light_n++; g_last_slot = slot; }
+static void host_set_task(int slot, const char *txt) {
+    snprintf(g_task, sizeof g_task, "%s", txt); g_task_n++; g_last_slot = slot;
+}
+static void host_set_question(int slot, const char *txt) {
+    snprintf(g_question, sizeof g_question, "%s", txt ? txt : ""); g_last_slot = slot;
+}
+static lc_dec_t host_wait_decision(int slot, int t) { g_dec_slot = slot; g_dec_timeout = t; return g_dec_reply; }
 static const char *host_status(void) { return "rojo"; }
 
 static char g_link_msg[48];
@@ -52,6 +60,7 @@ static const char *host_switch_link(const char *arg) {
 static const lc_host_t HOST = {
     .set_light = host_set_light,
     .set_task = host_set_task,
+    .set_question = host_set_question,
     .wait_decision = host_wait_decision,
     .status = host_status,
     .switch_link = host_switch_link,
@@ -60,7 +69,8 @@ static const lc_host_t HOST = {
 static void reset(void) {
     g_light = LC_OFF;
     g_light_n = g_task_n = 0;
-    g_task[0] = '\0';
+    g_last_slot = g_dec_slot = -1;
+    g_task[0] = g_question[0] = '\0';
     g_dec_timeout = -1;
     g_dec_reply = LC_DEC_NONE;
 }
@@ -159,6 +169,47 @@ int main(void) {
         /* 参数原样传给宿主，wifi/ble 之外的值由宿主拒（这里测的是透传） */
         CHECK(lc_exec(&HOST, "link xyz", out, sizeof out));
         CHECK_STR(out, "switch:xyz\n");
+    }
+
+    printf("@N 槽前缀（多会话）\n");
+    reset();
+    {
+        char out[64];
+        CHECK(lc_exec(&HOST, "@2 rojo", out, sizeof out));
+        CHECK_STR(out, "ok rojo\n");
+        CHECK(g_last_slot == 2 && g_light == LC_RED);
+        CHECK(lc_exec(&HOST, "@3 task 多开的任务", out, sizeof out));
+        CHECK_STR(out, "ok task\n");
+        CHECK_STR(g_task, "多开的任务");
+        CHECK(g_last_slot == 3);
+        /* 槽越界要拒绝而不是钳位——电脑侧映射错槽比失败更难查 */
+        CHECK(lc_exec(&HOST, "@4 rojo", out, sizeof out));
+        CHECK_STR(out, "err slot 0..3\n");
+        CHECK(lc_exec(&HOST, "@-1 rojo", out, sizeof out));
+        CHECK_STR(out, "err slot 0..3\n");
+        /* 没前缀 = 槽 0，单会话语义不变 */
+        CHECK(lc_exec(&HOST, "verde", out, sizeof out));
+        CHECK(g_last_slot == 0 && g_light == LC_GREEN);
+        CHECK(lc_exec(&HOST, "@1 decision 15", out, sizeof out));
+        CHECK(g_dec_slot == 1 && g_dec_timeout == 15);
+        /* 只有 @N 没有动词 = 不认识 */
+        CHECK(!lc_exec(&HOST, "@2", out, sizeof out));
+    }
+
+    printf("question 命令（授权问句）\n");
+    reset();
+    {
+        char out[64];
+        CHECK(lc_exec(&HOST, "question Bash: rm -rf /tmp/x", out, sizeof out));
+        CHECK_STR(out, "ok question\n");
+        CHECK_STR(g_question, "Bash: rm -rf /tmp/x");
+        CHECK(g_last_slot == 0);
+        CHECK(lc_exec(&HOST, "@1 question Write: main.c", out, sizeof out));
+        CHECK_STR(g_question, "Write: main.c");
+        CHECK(g_last_slot == 1);
+        /* 空文本 = 清空（宿主收到空串） */
+        CHECK(lc_exec(&HOST, "question", out, sizeof out));
+        CHECK_STR(g_question, "");
     }
 
     printf("回调为 NULL 时不能崩\n");

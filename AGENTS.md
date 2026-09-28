@@ -96,19 +96,30 @@ HTTP 端是路径 + 可选查询参数；BLE 端是往 RX 特征写一行文本�
 | 熄灭 | `GET/POST /off` | `off` | `ok off` |
 | 查状态 | `GET /status` | `status` | `state: verde\nip: 192.168.1.178\nclk: 60` |
 | 推任务摘要 | `GET /task?text=<URL编码>` 或 `POST /task`（正文即文本）| `task <文本>` | `ok task` |
-| 等授权决定 | `GET /decision?timeout=N` | `decision [N]` | `allow` / `deny` / `always` / `retry` / `none` |
+| 推授权问句 | `GET /question?text=<URL编码>` 或 `POST /question` | `question <文本>` | `ok` |
+| 等授权决定（推荐）| `GET /decision/start?timeout=N` + 轮询 `GET /decision/poll` | `decision [N]` | start→`ok`；poll→`pending` / `allow` / `deny` / `always` / `retry` / `none` |
+| 等授权决定（阻塞）| `GET /decision?timeout=N` | 同上 | 同上 |
 | 链路查询/切换 | `GET /link`、`GET /link?mode=wifi\|ble` | `link [wifi\|ble]` | `link: wifi` / `ok link, restart in 1s` |
 
 细节和坑：
 
+- **多会话（多开的 agent 各占一个槽）**：所有带状态的命令都可以带槽参数——
+  HTTP 加 `?s=N`（如 `/solo/rojo?s=1`），BLE 命令前加 `@N `（如 `@2 rojo`）。
+  槽共 4 个（0..3），不带参数 = 槽 0，单会话语义不变。设备上灯显示**聚合态**
+  （黄>红>绿>灭，最需要人管的赢），底部摘要轮播各会话的任务。
 - **`/task` 的文本最长 30 字节**（固件截断），CJK 会占多点，超长会被截。
 - 推摘要只在 `rojo`/`red`（开始干活）时有意义——设备把它显示在底部一行。
-- **黄灯 30 秒无人理会自动熄灭**，但 `/decision` 挂着等按键期间不会灭。
-- **`/decision` 会占住设备整个 HTTP 服务**（单 task 长轮询），等待期间其它
-  HTTP 请求排队。它同时把灯打黄、蜂鸣器滴两声。`N` 上限 120 秒，缺省 60。
+- **`/question` 推一行问句**（如 `Bash: rm -rf /tmp/x`，≤40 字符），黄灯的
+  授权界面会显示它，用户才知道到底在授权什么。应在 `decision/start` 之前发。
+- **授权推荐两段式**：先 `GET /decision/start?timeout=N&s=N`（毫秒级返回
+  `ok`，灯转黄 + 滴两声），然后每秒 `GET /decision/poll?s=N` 直到不再是
+  `pending`。**别用阻塞版 `/decision`**——它会占住设备整个 HTTP 服务
+  （单 task），等待期间其它 HTTP 请求全部排队超时。`N` 上限 120，缺省 60。
+- **黄灯 30 秒无人理会自动熄灭**（授权请求挂着时不会；请求超时后照常熄灭）。
 - `link <wifi|ble>` 切换后**设备 1 秒内重启**：WiFi→蓝牙会失去 IP，
   蓝牙→WiFi 要等它连上网。建议只在用户明确要求时用。
-- 不认识的命令：HTTP 返回 `err: ...`，BLE 回 `err unknown`。
+- 不认识的命令：HTTP 返回 `err: ...`，BLE 回 `err unknown`；槽号越界回
+  `err slot 0..3`。
 - 全部命令**无鉴权**：WiFi 模式下只有你局域网里的人能发；蓝牙模式是
   附近任何人都能连（GATT 不配对）。别把敏感信息推到 `/task`。
 
@@ -117,9 +128,13 @@ HTTP 端是路径 + 可选查询参数；BLE 端是往 RX 特征写一行文本�
 ```bash
 IP=192.168.1.178
 curl "http://$IP/status"
-curl "http://$IP/solo/rojo"
+curl "http://$IP/solo/rojo"                       # 槽 0（单会话）
+curl "http://$IP/solo/rojo?s=1"                   # 槽 1（多会话）
 curl "http://$IP/task?text=修登录bug"
-curl "http://$IP/decision?timeout=60"    # 阻塞最多 60s，等用户在掌机上按方向键
+# 授权两段式：
+curl "http://$IP/question?text=Bash:%20rm%20-rf%20/tmp/x&s=1"
+curl "http://$IP/decision/start?timeout=60&s=1"   # 登记，立即返回 ok
+curl "http://$IP/decision/poll?s=1"               # 每秒问一次：pending → allow/.../none
 curl "http://$IP/link"
 ```
 
@@ -156,9 +171,11 @@ deny 是「别做了」。
 2. **失败要无声**——灯只是个外设，推状态失败不应该打断 agent 工作流。
    想排查就手动跑（见 §3 速查）看哪步出错。
 3. **IP/链路要缓存**，连不上再重新发现，并做限流（建议 15 秒内不重复广播）。
-4. `/decision` 用的时候给个比设备侧 timeout 更长的超时（+10 秒），
+4. **多个 agent 实例多开**：给每个实例分配一个槽号（0..3），所有命令带
+   `?s=N` / `@N `；用 `/status` 的 `s<N>:` 行能看到各槽状态。
+5. `/decision` 用的时候给个比设备侧 timeout 更长的超时（+10 秒），
    设备侧没拿到就当 `none` 处理。
-5. 一台现成的参考实现：`~/.claude/hooks/traffic-light.py`（纯 Python 标准库，
+6. 一台现成的参考实现：`~/.claude/hooks/traffic-light.py`（纯 Python 标准库，
    BLE 路径依赖 bleak，装在 `~/.local/share/traffic-light-miao/pylib`）。
    它支持 `rojo/alerta/verde/off/status/task/ask` 子命令，两条链路自动择优
    并缓存到 `~/.cache/traffic-light-miao/`。

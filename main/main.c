@@ -102,10 +102,25 @@ static const char *TAG = "traffic";
 
 /* ── 状态机 ───────────────────────────────────────────────────────────── */
 typedef enum { ST_OFF, ST_RED, ST_YELLOW, ST_GREEN } light_t;
-static volatile light_t s_state = ST_OFF;
+
+/* ── 会话槽：支持多个 Claude 多开 ───────────────────────────────────────
+ * 每个电脑侧 agent 实例占一个槽（钩子用 session_id 映射，HTTP ?s=N / BLE @N）。
+ * 槽 0 是缺省槽，不带参数的旧命令全落这里。灯只有一个，显示聚合态：
+ * 黄 > 红 > 绿 > 灭（最需要人管的赢）。 */
+#define SESS_MAX 4
+typedef struct {
+    light_t  st;
+    uint32_t run_start;         /* 计时起点（st==ST_RED 时有效） */
+    uint32_t run_ms;            /* 冻结耗时（绿灯后） */
+    bool     run_live;
+    bool     alert_fin;         /* 黄灯 30s 到点了吗（按槽记） */
+    char     task[40];
+    char     question[48];      /* 授权问句：要授权的是什么操作 */
+} sess_t;
+static sess_t s_sessions[SESS_MAX];
 
 static bool          s_alert_on   = false;
-static uint32_t      s_alert_fin  = 0;
+static uint32_t      s_alert_start = 0;   /* 聚合态最近一次变黄的时刻 */
 static uint32_t      s_blink_next = 0;
 static bool          s_blink_fase = false;
 static volatile bool s_wifi_ok    = false;
@@ -619,6 +634,10 @@ static void wifi_start(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* 关 modem sleep：默认省电模式下射频周期性休眠，钩子的短超时请求
+     * 经常正好撞上设备睡着的间隙而超时——「命令经常不生效」的主因。
+     * 掌机常插着电，省这点电不值。 */
+    esp_wifi_set_ps(WIFI_PS_NONE);
     xTaskCreate(udp_task, "udp", 3072, NULL, 4, NULL);
 }
 #else /* !CONFIG_TRAFFIC_ENABLE_WIFI —— QEMU 假实现，用来验证 UI 流程 */
@@ -670,6 +689,7 @@ static void wifi_req_connect(const char *ssid, const char *pass) {
  *   热点列表 标题 + 6 行 SSID（含"返回"项）
  *   密码输入 SSID + 已输密码 + 6x10 字符网格（首行是 大小写/删除/确认）*/
 static lv_obj_t *s_scr_home, *s_scr_wifi, *s_scr_pass, *s_scr_ask, *s_scr_menu;
+static lv_obj_t *s_lbl_ask_q;          /* ask 界面的问句行 */
 
 /* 主界面（mochi 表情脸 + 状态文字 + 底部一行摘要/IP）*/
 static lv_obj_t *s_lbl_state, *s_lbl_foot, *s_lbl_time;
@@ -699,30 +719,30 @@ typedef enum { SCR_HOME, SCR_WIFI, SCR_PASS, SCR_ASK, SCR_MENU } scr_t;
 static scr_t s_scr = SCR_HOME;
 
 /* ── 底部一行：任务摘要 ↔ IP ──────────────────────────────────────────── */
-static char s_task[80];                 /* 当前任务摘要（HTTP/BLE /task 写入）*/
 static bool s_foot_show_ip = false;     /* 菜单里「显示 IP」切换 */
-
-/* ── 本段任务计时（和 Claude Code 终端里那个秒数对齐）────────────────────
- * 起点是灯变红那一刻（UserPromptSubmit → /solo/rojo），也就是终端开始
- * 计时的那一刻。变绿（Stop）后冻结成最终耗时，直到下一次变红才重新计。*/
-static uint32_t s_run_start;            /* 本次计时起点（ms），0 = 没在计 */
-static uint32_t s_run_ms;               /* 已经跑过的毫秒数（冻结后的值）*/
-static bool     s_run_live;             /* true = 正在走表 */
 
 /* ── 链路模式：WiFi(HTTP) 还是蓝牙(BLE) ─────────────────────────────────
  * 存在 NVS，开机时决定起哪一套。切换需要重启（菜单里选完就重启）。*/
 static bool s_ble_mode = false;
 
-/* ── 授权候选界面（黄灯时按 A 进入）─────────────────────────────────────
- * 按键后主循环写 s_decision，HTTP / BLE 侧在等它——那两边都跑在自己的
- * task 里，绝不能从那里碰 LVGL，所以只用两个 volatile 单字通信。 */
+/* ── 授权（按会话槽隔离）────────────────────────────────────────────────
+ * 电脑侧两段式：/decision/start 登记 pending → /decision/poll 轮询结果。
+ * poll 是毫秒级请求，httpd 不再被 60 秒长轮询占死——这是「多开时别的
+ * Claude 推送不生效」的修复之一。BLE 的 decision 命令（阻塞式）跑在
+ * ble worker 自己的任务里，仍然走 decide_wait。
+ * 按键后主循环写 dec——主循环是唯一允许碰 LVGL 的一方。 */
 #define DEC_NONE   0
 #define DEC_ALLOW  1    /* ↑ 继续：这一次允许 */
 #define DEC_DENY   2    /* → 拒绝 */
 #define DEC_ALWAYS 3    /* ← 总是接受更改：允许并写白名单 */
 #define DEC_RETRY  4    /* ↓ 重来：拒绝并附言让 Claude 重试 */
-static volatile int  s_decision = DEC_NONE;
-static volatile bool s_ask_pending = false;
+typedef struct {
+    volatile int  dec;          /* DEC_NONE = 还没答 */
+    volatile bool pending;      /* 有电脑侧在等这个槽的决定 */
+    volatile uint32_t deadline; /* start 时的 timeout（ms tick），主循环用来清账 */
+} ask_t;
+static ask_t s_asks[SESS_MAX];
+static volatile int s_ask_slot = -1;   /* ask 界面正在回答哪个槽（主循环维护） */
 
 static lv_obj_t *mk_label(lv_obj_t *parent, const char *txt,
                           const lv_font_t *f, uint32_t col) {
@@ -733,25 +753,29 @@ static lv_obj_t *mk_label(lv_obj_t *parent, const char *txt,
     return l;
 }
 
-/* 底部一行宽 160px：sc12 下半角字约 6px、汉字 12px。按「半角 1 单位、
- * 全角 2 单位」最多排 24 单位，超出就截断补 ".."——LVGL 的 label 不会自己
- * 裁掉溢出的字，会直接画到屏幕外面去。 */
-static void foot_set(const char *txt) {
-    char out[80];
+/* 按「半角 1 单位、全角 2 单位」截断文本到 max_units 单位，超出补 ".."。
+ * LVGL 的 label 不会自己裁掉溢出的字，会直接画到屏幕外，所以凡是要上屏的
+ * 动态文本都先过这里。 */
+static void fit_text(char *out, size_t osz, const char *txt, int max_units) {
     size_t o = 0;
     int units = 0;
     const unsigned char *p = (const unsigned char *)(txt ? txt : "");
-    while (*p && units < 24) {
+    while (*p && units < max_units) {
         int len = (*p < 0x80) ? 1 : (*p < 0xE0) ? 2 : (*p < 0xF0) ? 3 : 4;
         int adv = (*p < 0x80) ? 1 : 2;          /* 半角 1 单位，全角 2 单位 */
-        if (units + adv > 24) break;
-        if (o + (size_t)len + 3 > sizeof out) break;
+        if (units + adv > max_units) break;
+        if (o + (size_t)len + 3 > osz) break;
         for (int i = 0; i < len && p[i]; i++) out[o++] = (char)p[i];
         p += len;
         units += adv;
     }
     if (*p) { out[o++] = '.'; out[o++] = '.'; }
     out[o] = '\0';
+}
+
+static void foot_set(const char *txt) {
+    char out[80];
+    fit_text(out, sizeof out, txt, 24);
     lv_label_set_text(s_lbl_foot, out);
 }
 
@@ -804,9 +828,11 @@ static void build_home(void) {
 }
 
 /* 计时文本，格式对齐 Claude Code 终端的写法：不到一分钟只显示秒，
- * 之后是 1m23s，超过一小时 1h02m。全 ASCII，字体一定覆盖得到。 */
-static void run_text(char *out, size_t n) {
-    uint32_t ms = s_run_live ? (lv_tick_get() - s_run_start) : s_run_ms;
+ * 之后是 1m23s，超过一小时 1h02m。全 ASCII，字体一定覆盖得到。
+ * 显示的是聚合优先槽（正在黄/红的那一路）的耗时。 */
+static void run_text(char *out, size_t n, int slot) {
+    const sess_t *s = &s_sessions[slot];
+    uint32_t ms = s->run_live ? (lv_tick_get() - s->run_start) : s->run_ms;
     uint32_t sec = ms / 1000;
     if (sec < 60)          snprintf(out, n, "%us", (unsigned)sec);
     else if (sec < 3600)   snprintf(out, n, "%um%02us", (unsigned)(sec / 60),
@@ -814,12 +840,6 @@ static void run_text(char *out, size_t n) {
     else                   snprintf(out, n, "%uh%02um", (unsigned)(sec / 3600),
                                     (unsigned)((sec / 60) % 60));
 }
-
-/* 开始 / 结束 / 清空 本段计时 */
-static void run_begin(void) { s_run_start = lv_tick_get(); s_run_ms = 0; s_run_live = true; }
-static void run_end(void)   { if (s_run_live) { s_run_ms = lv_tick_get() - s_run_start;
-                                                s_run_live = false; } }
-static void run_clear(void) { s_run_live = false; s_run_ms = 0; }
 
 static void build_wifi(void) {
     lv_obj_t *scr = lv_obj_create(NULL);
@@ -1005,10 +1025,26 @@ static void build_ask(void) {
     lv_obj_t *t = mk_label(scr, "NEEDS YOU !", &lv_font_montserrat_14, C_YELLOW);
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 3);
 
+    /* 问句：这次要授权的到底是什么（工具 + 关键参数）。
+     * 最多 3 行，超长由 ask_refresh 截断；没推问句就显示占位提示。 */
+    s_lbl_ask_q = mk_label(scr, "", &lv_font_sc12, UI_DIM);
+    lv_obj_set_pos(s_lbl_ask_q, 8, 22);
+    lv_obj_set_width(s_lbl_ask_q, 146);
+    lv_label_set_long_mode(s_lbl_ask_q, LV_LABEL_LONG_DOT);
+
+    /* 四个选项：sc12 字体、行高 17，从 y=62 起（62+68=130 压线，
+     * 最后一行 62+3*17=113，字高 12 → 底 125，放得下） */
     for (int i = 0; i < 4; i++) {
-        lv_obj_t *l = mk_label(scr, ASK_ROWS[i].txt, &lv_font_sc14, ASK_ROWS[i].col);
-        lv_obj_set_pos(l, 8, 26 + i * 22);
+        lv_obj_t *l = mk_label(scr, ASK_ROWS[i].txt, &lv_font_sc12, ASK_ROWS[i].col);
+        lv_obj_set_pos(l, 8, 62 + i * 17);
     }
+}
+
+/* ask 界面内容随 s_ask_slot 刷新：问句 + 该槽的摘要兜底 */
+static void ask_refresh(int slot) {
+    const char *q = (slot >= 0 && slot < SESS_MAX) ? s_sessions[slot].question : "";
+    if (!q[0]) q = "（电脑没说是什么操作）";
+    lv_label_set_text(s_lbl_ask_q, q);
 }
 
 /* ── 设置菜单（首页短按 ↑ 进入）─────────────────────────────────────────
@@ -1105,30 +1141,65 @@ static void msg_show(const char *txt, uint32_t ms) {
     wifi_refresh();
 }
 
-/* ── 状态切换（HTTP / BLE 任务上下文调用：只改状态，渲染全在主循环）────
- * 这里也会被 httpd / ble worker 的任务调到，所以只碰 volatile 单字和
- * LEDC 寄存器，绝不碰 LVGL 对象。 */
-static void set_state(light_t st) {
-    light_t prev = s_state;
-    s_state = st;
-    if (st == ST_YELLOW) {
-        s_alert_on   = true;
-        s_alert_fin  = lv_tick_get() + ALERTA_MS;
-        s_blink_next = 0;
-        s_blink_fase = false;
-        if (prev != ST_YELLOW) beep_two();      /* 需要你操作：滴 滴 */
-    } else {
-        s_alert_on = false;
-        if (st == ST_GREEN) {                   /* 任务完成：滴 滴 */
-            run_end();
-            if (prev != ST_GREEN) beep_two();
-        } else if (st == ST_RED) {              /* 开始干活：起表 */
-            run_begin();                        /* 每次新输入都重新起表 */
-        } else {
-            run_clear();
+/* ── 会话槽操作（HTTP / BLE 任务上下文调用：只改状态，渲染全在主循环）──
+ * 这些函数会被 httpd / ble worker 的任务调到，所以只碰普通内存和 LEDC
+ * 寄存器，绝不碰 LVGL 对象。 */
+
+/* 聚合态：黄 > 红 > 绿 > 灭，最需要人管的赢。
+ * 返回聚合态；*slot_out（可空）给「该状态归属哪个槽」（同状态取最小槽号）。*/
+static light_t agg_state(volatile int *slot_out) {
+    static const light_t prio[] = { ST_YELLOW, ST_RED, ST_GREEN };
+    for (unsigned p = 0; p < sizeof prio / sizeof prio[0]; p++)
+        for (int i = 0; i < SESS_MAX; i++)
+            if (s_sessions[i].st == prio[p]) {
+                if (slot_out) *slot_out = i;
+                return prio[p];
+            }
+    if (slot_out) *slot_out = 0;
+    return ST_OFF;
+}
+
+/* 槽位状态迁移。蜂鸣只在**聚合态**跨越黄/绿边界时响——多会话下 B 会话
+ * 的黄灯不该因为 A 会话也在黄灯就多响一轮。 */
+static void sess_set(int slot, light_t st) {
+    if (slot < 0 || slot >= SESS_MAX) slot = 0;
+    sess_t *s = &s_sessions[slot];
+    light_t before = agg_state(NULL);
+    s->st = st;
+    s->alert_fin = false;
+    switch (st) {
+    case ST_RED:                        /* 开始干活：起表 */
+        s->run_start = lv_tick_get();
+        s->run_ms = 0;
+        s->run_live = true;
+        break;
+    case ST_GREEN:                      /* 任务完成：冻结计时 */
+        if (s->run_live) { s->run_ms = lv_tick_get() - s->run_start; s->run_live = false; }
+        break;
+    case ST_YELLOW:
+        break;                          /* 30s 到点由主循环按槽记（见 alert_fin）*/
+    default:                            /* off */
+        s->run_live = false;
+        s->run_ms = 0;
+        break;
+    }
+    light_t after = agg_state(NULL);
+    if (after != before) {
+        if (after == ST_YELLOW) {
+            beep_two();                 /* 需要你操作：滴 滴 */
+            s_alert_on = true;
+            s_alert_start = lv_tick_get();
+            s_blink_next = 0;
+            s_blink_fase = false;
+        } else if (before == ST_YELLOW) {
+            s_alert_on = false;
         }
+        if (after == ST_GREEN && before != ST_GREEN) beep_two();
     }
 }
+
+/* 兼容旧调用点（QEMU 按键直驱、lc 回调等，全是槽 0）*/
+static inline void set_state(light_t st) { sess_set(0, st); }
 
 static void render_state(light_t st) {
     mochi_draw(mochi_of(st));
@@ -1230,14 +1301,19 @@ static void pass_key(uint8_t code, bool lng) {
     }
 }
 
-/* 候选界面按键：方向键直接做出决定，B 退回（不做决定）。 */
+/* 候选界面按键：方向键直接做出决定，B 退回（不做决定）。
+ * 决定写进当前正在回答的槽（s_ask_slot）；答完把该槽转红/绿——但如果
+ * 别的槽还挂着 pending 的授权，聚合态仍会是黄，灯不会骗人。 */
 static void ask_key(uint8_t code, bool lng) {
     if (lng) return;
+    int slot = s_ask_slot;
     for (int i = 0; i < 4; i++) {
         if (code != ASK_ROWS[i].key) continue;
         int d = ASK_ROWS[i].dec;
-        s_decision = d;
-        set_state((d == DEC_ALLOW || d == DEC_ALWAYS) ? ST_GREEN : ST_RED);
+        if (slot >= 0 && slot < SESS_MAX) {
+            s_asks[slot].dec = d;
+            sess_set(slot, (d == DEC_ALLOW || d == DEC_ALWAYS) ? ST_GREEN : ST_RED);
+        }
         ui_show(SCR_HOME);
         return;
     }
@@ -1326,8 +1402,12 @@ static void handle_event(uint8_t ev) {
                 ui_show(SCR_MENU);
             }
         }
-        else if (code == EV_A && !lng && s_state == ST_YELLOW) {
-            ui_show(SCR_ASK);               /* 黄灯（要授权）时按 A 进候选界面 */
+        else if (code == EV_A && !lng && agg_state(NULL) == ST_YELLOW) {
+            /* 黄灯（要授权）时按 A 进候选界面；回答哪个槽 =
+             * 聚合态的归属槽（黄>红>绿，最需要人管的赢） */
+            agg_state(&s_ask_slot);
+            ask_refresh(s_ask_slot);
+            ui_show(SCR_ASK);
         }
 #if !CONFIG_TRAFFIC_ENABLE_WIFI
         /* QEMU 无 HTTP：另外几个键驱动状态，方便验证灯与文字 */
@@ -1345,11 +1425,29 @@ static void handle_event(uint8_t ev) {
 }
 
 #if !CONFIG_TRAFFIC_ENABLE_WIFI
+/* 前置声明：demo 时间轴要用（定义在 WiFi/授权那一节）*/
+static void sess_set_task(int slot, const char *txt);
+static void sess_set_question(int slot, const char *txt);
+static void ask_start(int slot, int timeout_s);
+
+/* 多会话演示步骤：模拟两个多开的 Claude 各占一个槽。
+ * sess_set/sess_set_task/sess_set_question/ask_start 正是 HTTP 与 BLE
+ * 命令最终调用的函数，QEMU 里没有链路就直接调它们。 */
+static void demo_ms1(void) {                /* 实例1：开始干活 */
+    sess_set(1, ST_RED);
+    sess_set_task(1, "修花屏并加授权候选界面");
+}
+static void demo_ms2(void) {                /* 实例2：要授权 */
+    sess_set(2, ST_YELLOW);
+    sess_set_task(2, "重构 HTTP 路由");
+    sess_set_question(2, "Bash: rm -rf /tmp/build");
+}
+
 /* QEMU 自检：QEMU 的 esp32 机型收不到串口输入，改为按时间轴自动走一遍 UI，
  * 每步把屏幕打成字符画，用来在无硬件时肉眼验证界面与流程。
  * 走的是和真机按键完全相同的 handle_event() 路径。 */
 static void demo_run(void) {
-    typedef struct { uint32_t ms; int ev; const char *dump; } step_t;
+    typedef struct { uint32_t ms; int ev; const char *dump; void (*fn)(void); } step_t;
     static const step_t SEQ[] = {
         {  6000, EV_B|EV_LONG, NULL },          /* 长按B返回主界面 */
         {  8000, -1,         "1 主界面(熄灭)" },
@@ -1447,6 +1545,19 @@ static void demo_run(void) {
         { 95000, EV_A,       NULL },            /* 切 → 蓝牙 */
         { 95800, -1,         "35 连接=蓝牙 且 RESTART 提示" },
         { 96800, -1,         "36 提示已消失(连接仍是蓝牙)" },
+
+        /* 多会话：两个 Claude 多开实例各占一个槽。QEMU 里没有 HTTP/BLE，
+         * 直接调与两条链路共用的会话函数，走的路径和收到 @N 命令一致。 */
+        { 97500, EV_B,       NULL },            /* 回主界面看聚合灯与轮播 */
+        { 98000, 0, NULL, demo_ms1 },           /* 槽1 红灯 + 任务摘要 */
+        { 99000, -1,         "37 多会话:槽1红灯(聚合红,摘要=槽1)" },
+        {100000, 0, NULL, demo_ms2 },           /* 槽2 黄灯 + 任务摘要 + 问句 */
+        {101000, -1,         "38 槽2黄灯(聚合黄,摘要轮播)" },
+        {101500, -1,         "39 摘要轮播到槽2" },
+        {102000, EV_A,       NULL },            /* 黄灯时按 A → ask 界面 */
+        {103000, -1,         "40 ask界面(问句=槽2的授权问题)" },
+        {104000, EV_UP,      NULL },            /* ↑ = 槽2 允许 → 转绿 */
+        {105000, -1,         "41 槽2已答(聚合红回落,只剩槽1)" },
     };
     static int i = 0;
     static uint32_t t0 = 0;
@@ -1455,12 +1566,14 @@ static void demo_run(void) {
     if ((int32_t)(lv_tick_get() - hb) >= 0) {
         hb = lv_tick_get() + 2000;
         ESP_LOGI(TAG, "hb t=%lu scr=%d state=%d scan=%d conn=%d msg=%lu step=%d",
-                 (unsigned long)(lv_tick_get() - t0), s_scr, s_state,
+                 (unsigned long)(lv_tick_get() - t0), s_scr, (int)agg_state(NULL),
                  s_scanning, s_connecting, (unsigned long)s_msg_until, i);
     }
     while (i < (int)(sizeof SEQ / sizeof SEQ[0]) &&
            (int32_t)(lv_tick_get() - t0) >= (int32_t)SEQ[i].ms) {
-        if (SEQ[i].ev >= 0) {
+        if (SEQ[i].fn) {
+            SEQ[i].fn();                    /* 多会话演示：直接驱动会话槽 */
+        } else if (SEQ[i].ev >= 0) {
             handle_event((uint8_t)SEQ[i].ev);
         } else {
             printf("\n--- %s ---\n", SEQ[i].dump);
@@ -1474,28 +1587,64 @@ static void demo_run(void) {
 #endif
 
 /* ── HTTP ─────────────────────────────────────────────────────────────── */
+/* 写一个槽的任务摘要（h_task 和 BLE 的 task 命令共用）。
+ * 两个链路都要用，QEMU 自检也要直接调它演示多会话，所以不在 WiFi 块里。 */
+static void sess_set_task(int slot, const char *txt) {
+    if (slot < 0 || slot >= SESS_MAX) slot = 0;
+    fit_text(s_sessions[slot].task, sizeof s_sessions[slot].task,
+             txt ? txt : "", 19);
+    ESP_LOGI(TAG, "task[%d]: %s", slot, s_sessions[slot].task);
+}
+
+/* 写一个槽的授权问句（h_question 和 BLE 的 question 命令共用），同样双链路 */
+static void sess_set_question(int slot, const char *txt) {
+    if (slot < 0 || slot >= SESS_MAX) slot = 0;
+    if (txt && *txt) fit_text(s_sessions[slot].question,
+                              sizeof s_sessions[slot].question, txt, 23);
+    else             s_sessions[slot].question[0] = '\0';
+    ESP_LOGI(TAG, "question[%d]: %s", slot, s_sessions[slot].question);
+}
+
 #if CONFIG_TRAFFIC_ENABLE_WIFI
+
+/* 会话槽参数：?s=N，缺省 0。多开的几个 Claude 各占一个槽，
+ * 不带参数的老命令全部落槽 0，单会话语义不变。 */
+static int query_slot(httpd_req_t *req) {
+    char q[32] = "", val[4] = "";
+    if (httpd_req_get_url_query_len(req) > 0 &&
+        httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK &&
+        httpd_query_key_value(q, "s", val, sizeof val) == ESP_OK) {
+        int s = atoi(val);
+        if (s >= 0 && s < SESS_MAX) return s;
+    }
+    return 0;
+}
+
 static esp_err_t h_alerta(httpd_req_t *req) {
-    set_state(ST_YELLOW);
+    sess_set(query_slot(req), ST_YELLOW);
     return httpd_resp_send(req, "ok alerta\n", HTTPD_RESP_USE_STRLEN);
 }
 static esp_err_t h_rojo(httpd_req_t *req) {
-    set_state(ST_RED);
+    sess_set(query_slot(req), ST_RED);
     return httpd_resp_send(req, "ok solo rojo\n", HTTPD_RESP_USE_STRLEN);
 }
 static esp_err_t h_verde(httpd_req_t *req) {
-    set_state(ST_GREEN);
+    sess_set(query_slot(req), ST_GREEN);
     return httpd_resp_send(req, "ok solo verde\n", HTTPD_RESP_USE_STRLEN);
 }
 static esp_err_t h_off(httpd_req_t *req) {
-    set_state(ST_OFF);
+    sess_set(query_slot(req), ST_OFF);
     return httpd_resp_send(req, "ok off\n", HTTPD_RESP_USE_STRLEN);
 }
 static esp_err_t h_status(httpd_req_t *req) {
     static const char *names[] = {"off", "rojo", "amarillo", "verde"};
-    char buf[80];
-    snprintf(buf, sizeof buf, "state: %s\nip: %s\nclk: %d\n",
-             names[s_state], s_ipbuf, s_spi_hz / 1000000);
+    char buf[320];
+    int o = snprintf(buf, sizeof buf, "state: %s\nip: %s\nclk: %d\n",
+             names[agg_state(NULL)], s_ipbuf, s_spi_hz / 1000000);
+    for (int i = 0; i < SESS_MAX && o < (int)sizeof buf - 2; i++)
+        if (s_sessions[i].st != ST_OFF || s_sessions[i].task[0])
+            o += snprintf(buf + o, sizeof buf - o, "s%d: %s %s\n",
+                          i, names[s_sessions[i].st], s_sessions[i].task);
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -1526,7 +1675,7 @@ static void strip_ctl(char *s) {
 }
 
 /* POST /task  正文即摘要（UTF-8 原始字节）
- * GET  /task?text=...  便于 curl 手测，需 URL 编码 */
+ * GET  /task?text=...&s=N  便于 curl 手测，需 URL 编码 */
 static esp_err_t h_task(httpd_req_t *req) {
     char buf[96] = "";
     int n = 0;
@@ -1542,37 +1691,54 @@ static esp_err_t h_task(httpd_req_t *req) {
         url_decode(buf);
     }
     strip_ctl(buf);
-    strlcpy(s_task, buf, sizeof s_task);
-    ESP_LOGI(TAG, "task: %s", s_task);
+    int slot = query_slot(req);
+    sess_set_task(slot, buf);
     return httpd_resp_send(req, "ok\n", HTTPD_RESP_USE_STRLEN);
 }
 
-/* 转黄灯提醒用户，然后每 50ms 看一眼 s_decision，最多等 timeout_s 秒。
- * HTTP /decision 和蓝牙的 decision 命令共用这一段——两条链路的授权语义
- * 必须一模一样，所以只留一份实现。
- *
- * 注意：这是**阻塞**的，会占住调用它的任务整个等待期间。调用方必须是自己
- * 的任务（httpd task / ble worker），绝不能是 LVGL 所在的主循环。 */
-static int decide_wait(int timeout_s) {
-    static const char *names[] = { "none", "allow", "deny", "always", "retry" };
+/* ── 授权：登记 / 轮询（两段式，不占 httpd）─────────────────────────── */
+
+/* start：把槽转黄（聚合态下别的槽的黄/红优先级不变），登记 pending 和
+ * 截止时间，立即返回。真正等结果由 poll 一趟趟来。 */
+static void ask_start(int slot, int timeout_s) {
+    if (slot < 0 || slot >= SESS_MAX) slot = 0;
     if (timeout_s < 1)   timeout_s = 1;
     if (timeout_s > 120) timeout_s = 120;
+    s_asks[slot].dec = DEC_NONE;
+    s_asks[slot].pending = true;
+    s_asks[slot].deadline = lv_tick_get() + (uint32_t)timeout_s * 1000;
+    sess_set(slot, ST_YELLOW);
+}
 
-    s_decision = DEC_NONE;
-    s_ask_pending = true;
-    if (s_state != ST_YELLOW) set_state(ST_YELLOW);
-
-    int ms = 0;
-    while (s_decision == DEC_NONE && ms < timeout_s * 1000) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        ms += 50;
+/* poll：拿到结果就清账返回；超时由**主循环**兜底清 pending（电脑侧中途
+ * 掉线时不留幽灵请求）。返回值是 DEC_*，调用方翻译成名字。 */
+static int ask_poll(int slot) {
+    if (slot < 0 || slot >= SESS_MAX) return DEC_NONE;
+    ask_t *a = &s_asks[slot];
+    if (!a->pending) return DEC_NONE;
+    int d = a->dec;
+    if (d != DEC_NONE) {
+        a->pending = false;
+        a->dec = DEC_NONE;
     }
+    return d;
+}
 
-    s_ask_pending = false;
-    int d = s_decision;
-    s_decision = DEC_NONE;
-    if (d < 0 || d > 4) d = 0;
-    ESP_LOGI(TAG, "decision: %s", names[d]);
+/* 阻塞版：BLE 的 decision 命令用（跑在 ble worker 自己的任务里）。
+ * WiFi 侧已经改走 start/poll，这条路留作蓝牙和手工测试。 */
+static int decide_wait(int slot, int timeout_s) {
+    static const char *names[] = { "none", "allow", "deny", "always", "retry" };
+    ask_start(slot, timeout_s);
+    if (slot < 0 || slot >= SESS_MAX) slot = 0;
+    ask_t *a = &s_asks[slot];
+    uint32_t deadline = a->deadline;
+    while (a->pending && a->dec == DEC_NONE &&
+           (int32_t)(lv_tick_get() - deadline) < 0) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    int d = ask_poll(slot);
+    if (d == DEC_NONE) d = 0;
+    ESP_LOGI(TAG, "decision[%d]: %s", slot, names[d]);
     return d;
 }
 
@@ -1586,20 +1752,19 @@ _Static_assert((int)LC_DEC_NONE == (int)DEC_NONE && (int)LC_DEC_ALLOW == (int)DE
                (int)LC_DEC_DENY == (int)DEC_DENY && (int)LC_DEC_ALWAYS == (int)DEC_ALWAYS &&
                (int)LC_DEC_RETRY == (int)DEC_RETRY, "lc_dec_t 必须与 DEC_* 逐项对齐");
 
-static void lc_set_light(lc_light_t st) { set_state((light_t)st); }
+static void lc_set_light(int slot, lc_light_t st) { sess_set(slot, (light_t)st); }
 
-static void lc_set_task(const char *txt) {
-    strlcpy(s_task, txt ? txt : "", sizeof s_task);
-    ESP_LOGI(TAG, "task: %s", s_task);
-}
+static void lc_set_task(int slot, const char *txt) { sess_set_task(slot, txt); }
 
-static lc_dec_t lc_wait_decision(int timeout_s) {
-    return (lc_dec_t)decide_wait(timeout_s);
+static void lc_set_question(int slot, const char *txt) { sess_set_question(slot, txt); }
+
+static lc_dec_t lc_wait_decision(int slot, int timeout_s) {
+    return (lc_dec_t)decide_wait(slot, timeout_s);
 }
 
 static const char *lc_status(void) {
     static const char *names[] = { "off", "rojo", "amarillo", "verde" };
-    return names[s_state];
+    return names[agg_state(NULL)];
 }
 
 /* link [wifi|ble] —— 从电脑切掌机的链路模式，跟设置菜单里那一项同义。
@@ -1627,12 +1792,30 @@ static const char *lc_switch_link(const char *arg) {
 static const lc_host_t LC_HOST = {
     .set_light     = lc_set_light,
     .set_task      = lc_set_task,
+    .set_question  = lc_set_question,
     .wait_decision = lc_wait_decision,
     .status        = lc_status,
     .switch_link   = lc_switch_link,
 };
 
 /* GET /decision?timeout=N  —— 长轮询等掌机上的按键。 */
+/* 两段式授权（多开下 httpd 不再被长轮询占死）：
+ *   /decision/start?timeout=N&s=N  → 登记，立即回 "ok"
+ *   /decision/poll?s=N             → "pending" / "allow" / ... / "none"
+ * 旧的一条式 /decision?timeout=N 保留（阻塞版），蓝牙路径和手测用。 */
+static esp_err_t h_decision_start(httpd_req_t *req) {
+    int timeout = 60;
+    char q[64] = "", val[8] = "";
+    if (httpd_req_get_url_query_len(req) > 0 &&
+        httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK &&
+        httpd_query_key_value(q, "timeout", val, sizeof val) == ESP_OK)
+        timeout = atoi(val);
+    ask_start(query_slot(req), timeout);
+    return httpd_resp_send(req, "ok\n", HTTPD_RESP_USE_STRLEN);
+}
+
+/* 阻塞版（蓝牙路径、手测）：占住 httpd 直到有决定或超时。
+ * 钩子走的是 start/poll，别用这条。 */
 static esp_err_t h_decision(httpd_req_t *req) {
     static const char *names[] = { "none", "allow", "deny", "always", "retry" };
     int timeout = 60;
@@ -1641,10 +1824,41 @@ static esp_err_t h_decision(httpd_req_t *req) {
         httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK &&
         httpd_query_key_value(q, "timeout", val, sizeof val) == ESP_OK)
         timeout = atoi(val);
-
     char buf[16];
-    snprintf(buf, sizeof buf, "%s\n", names[decide_wait(timeout)]);
+    snprintf(buf, sizeof buf, "%s\n", names[decide_wait(query_slot(req), timeout)]);
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t h_decision_poll(httpd_req_t *req) {
+    static const char *names[] = { "none", "allow", "deny", "always", "retry" };
+    char buf[16];
+    int slot = query_slot(req);
+    int d = ask_poll(slot);
+    if (d == DEC_NONE && slot >= 0 && slot < SESS_MAX && s_asks[slot].pending)
+        snprintf(buf, sizeof buf, "pending\n");
+    else
+        snprintf(buf, sizeof buf, "%s\n", names[d]);
+    return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+/* 授权问句：这次要授权的到底是什么操作。ask 界面黄灯时显示。 */
+static esp_err_t h_question(httpd_req_t *req) {
+    char buf[96] = "";
+    int n = 0;
+    if (req->method == HTTP_POST && req->content_len > 0) {
+        n = req->content_len < (int)sizeof buf - 1 ? req->content_len : (int)sizeof buf - 1;
+        if (httpd_req_recv(req, buf, n) <= 0) n = 0;
+        buf[n] = '\0';
+    } else {
+        char q[160] = "";
+        if (httpd_req_get_url_query_len(req) > 0 &&
+            httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK)
+            httpd_query_key_value(q, "text", buf, sizeof buf);
+        url_decode(buf);
+    }
+    strip_ctl(buf);
+    lc_set_question(query_slot(req), buf);
+    return httpd_resp_send(req, "ok\n", HTTPD_RESP_USE_STRLEN);
 }
 
 /* GET /link          → 当前链路模式
@@ -1666,22 +1880,26 @@ static void start_webserver(void) {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
-    config.max_uri_handlers = 14;    /* 默认 8；现在有 13 条 URI */
+    config.max_uri_handlers = 18;    /* 默认 8；现在有 17 条 URI */
     ESP_ERROR_CHECK(httpd_start(&server, &config));
     httpd_uri_t uris[] = {
-        { .uri = "/alerta",     .method = HTTP_POST, .handler = h_alerta },
-        { .uri = "/alerta",     .method = HTTP_GET,  .handler = h_alerta },
-        { .uri = "/solo/rojo",  .method = HTTP_POST, .handler = h_rojo   },
-        { .uri = "/solo/rojo",  .method = HTTP_GET,  .handler = h_rojo   },
-        { .uri = "/solo/verde", .method = HTTP_POST, .handler = h_verde  },
-        { .uri = "/solo/verde", .method = HTTP_GET,  .handler = h_verde  },
-        { .uri = "/off",        .method = HTTP_POST, .handler = h_off    },
-        { .uri = "/off",        .method = HTTP_GET,  .handler = h_off    },
-        { .uri = "/status",     .method = HTTP_GET,  .handler = h_status },
-        { .uri = "/task",       .method = HTTP_POST, .handler = h_task   },
-        { .uri = "/task",       .method = HTTP_GET,  .handler = h_task   },
-        { .uri = "/decision",   .method = HTTP_GET,  .handler = h_decision },
-        { .uri = "/link",       .method = HTTP_GET,  .handler = h_link   },
+        { .uri = "/alerta",        .method = HTTP_POST, .handler = h_alerta },
+        { .uri = "/alerta",        .method = HTTP_GET,  .handler = h_alerta },
+        { .uri = "/solo/rojo",     .method = HTTP_POST, .handler = h_rojo   },
+        { .uri = "/solo/rojo",     .method = HTTP_GET,  .handler = h_rojo   },
+        { .uri = "/solo/verde",    .method = HTTP_POST, .handler = h_verde  },
+        { .uri = "/solo/verde",    .method = HTTP_GET,  .handler = h_verde  },
+        { .uri = "/off",           .method = HTTP_POST, .handler = h_off    },
+        { .uri = "/off",           .method = HTTP_GET,  .handler = h_off    },
+        { .uri = "/status",        .method = HTTP_GET,  .handler = h_status },
+        { .uri = "/task",          .method = HTTP_POST, .handler = h_task   },
+        { .uri = "/task",          .method = HTTP_GET,  .handler = h_task   },
+        { .uri = "/question",      .method = HTTP_POST, .handler = h_question },
+        { .uri = "/question",      .method = HTTP_GET,  .handler = h_question },
+        { .uri = "/decision",      .method = HTTP_GET,  .handler = h_decision },
+        { .uri = "/decision/start",.method = HTTP_GET,  .handler = h_decision_start },
+        { .uri = "/decision/poll", .method = HTTP_GET,  .handler = h_decision_poll },
+        { .uri = "/link",          .method = HTTP_GET,  .handler = h_link   },
     };
     for (size_t i = 0; i < sizeof uris / sizeof uris[0]; i++)
         ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uris[i]));
@@ -1848,40 +2066,74 @@ void app_main(void) {
             else if (s_scr == SCR_PASS) lv_obj_add_flag(s_pw_msg, LV_OBJ_FLAG_HIDDEN);
         }
 
-        /* 底部一行：默认任务摘要，短按 ↑ 切成 IP。内容变了才重设 label，
-         * 否则每帧 set_text 会白白让整屏重绘 */
+        /* 底部一行：默认轮播各会话的任务摘要（多开时每 4 秒换一路），
+         * 短按 ↑ 切成 IP。内容变了才重设 label，否则每帧 set_text 会
+         * 白白让整屏重绘 */
         char want[96];
-        if (s_foot_show_ip && s_wifi_ok) snprintf(want, sizeof want, "http://%s", s_ipbuf);
-        else if (s_task[0])              strlcpy(want, s_task, sizeof want);
-        else                             strlcpy(want, s_wifi_ok ? "空闲中" : "未连接", sizeof want);
+        if (s_foot_show_ip && s_wifi_ok) {
+            snprintf(want, sizeof want, "http://%s", s_ipbuf);
+        } else {
+            /* 轮播优先级：黄 > 红 > 绿 > 灭；同轮内从上次槽的下一个找 */
+            static int rot = 0;
+            static uint32_t rot_at = 0;
+            const char *pick = s_wifi_ok ? "空闲中" : "未连接";
+            int n_any = 0;
+            if (lv_tick_get() - rot_at >= 4000) {
+                rot_at = lv_tick_get();
+                for (int k = 0; k < SESS_MAX; k++) {
+                    int i = (rot + 1 + k) % SESS_MAX;
+                    if (s_sessions[i].task[0]) { rot = i; n_any++; break; }
+                    if (s_sessions[i].st != ST_OFF) n_any++;
+                }
+            }
+            if (s_sessions[rot].task[0]) pick = s_sessions[rot].task;
+            else if (rot != 0) { rot = 0; pick = s_sessions[0].task; }
+            (void)n_any;
+            strlcpy(want, pick[0] ? pick : (s_wifi_ok ? "空闲中" : "未连接"),
+                    sizeof want);
+        }
         if (strcmp(want, foot_shown)) {
             strlcpy(foot_shown, want, sizeof foot_shown);
             foot_set(want);
         }
 
-        /* 计时器：和底部一行一样的 dirty-check，同秒内不重设 label */
+        /* 计时器：显示聚合优先槽的耗时；和底部一行一样做 dirty-check */
+        int agg_slot = 0;
+        light_t st = agg_state(&agg_slot);
         char tbuf[16] = "";
-        if (s_run_live || s_run_ms) run_text(tbuf, sizeof tbuf);
+        if (s_sessions[agg_slot].run_live || s_sessions[agg_slot].run_ms)
+            run_text(tbuf, sizeof tbuf, agg_slot);
         if (strcmp(tbuf, time_shown)) {
             strlcpy(time_shown, tbuf, sizeof time_shown);
             lv_label_set_text(s_lbl_time, tbuf);
         }
 
-        light_t st = s_state;
         bool blink_phase = true;
         if (st == ST_YELLOW && s_alert_on) {
             uint32_t now = lv_tick_get();
-            /* 有钩子在等授权结果时不许自动熄灭，否则用户还没按键灯就没了 */
-            if (now >= s_alert_fin && !s_ask_pending) {
-                s_alert_on = false;
-                s_state = ST_OFF;
-                st = ST_OFF;
-            } else {
-                if (now >= s_blink_next) {
-                    s_blink_fase = !s_blink_fase;
-                    s_blink_next = now + BLINK_MS;
+            /* 过期的授权请求先清账：电脑侧 start 登记的 deadline 到了没人按，
+             * 就把 pending 撤掉（poll 会得到 none）——不然 pending 一直挂着，
+             * 下面的 30s 自动熄灯被 any_pending 永久挡住，黄灯不灭。 */
+            for (int i = 0; i < SESS_MAX; i++)
+                if (s_asks[i].pending && (int32_t)(now - s_asks[i].deadline) >= 0) {
+                    s_asks[i].pending = false;
+                    ESP_LOGI(TAG, "decision[%d] 超时无人按，撤销 pending", i);
                 }
-                blink_phase = s_blink_fase;
+            /* 有钩子在等授权结果时不许自动熄灭，否则用户还没按键灯就没了。
+             * 黄灯 30s 到点按槽记账（sess_set 每次清，这里对黄灯槽统一判）。*/
+            bool any_pending = false;
+            for (int i = 0; i < SESS_MAX; i++)
+                if (s_asks[i].pending) any_pending = true;
+            if (now >= s_blink_next) {
+                s_blink_fase = !s_blink_fase;
+                s_blink_next = now + BLINK_MS;
+            }
+            blink_phase = s_blink_fase;
+            if (!any_pending && now - s_alert_start >= ALERTA_MS) {
+                /* 30 秒无人理会：把还黄着的槽全部熄灭 */
+                for (int i = 0; i < SESS_MAX; i++)
+                    if (s_sessions[i].st == ST_YELLOW) sess_set(i, ST_OFF);
+                st = agg_state(&agg_slot);
             }
         }
 

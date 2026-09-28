@@ -194,22 +194,31 @@ Claude Code 照常弹它自己的询问。
 | 黄 | `POST/GET /alerta` | `alerta`（别名 `yellow`）| `ok alerta` |
 | 绿 | `POST/GET /solo/verde` | `verde`（别名 `green`）| `ok verde` |
 | 灭 | `POST/GET /off` | `off` | `ok off` |
-| 查询 | `GET /status` | `status` | `state: rojo` |
+| 查询 | `GET /status` | `status` | `state: rojo` + 各槽行 |
 | 摘要 | `POST /task`（正文即摘要）| `task <文本>` | `ok task` |
-| 授权 | `GET /decision?timeout=N` | `decision [N]` | `allow`/`deny`/`always`/`retry`/`none` |
+| 问句 | `POST /question`（正文即问句）| `question <文本>` | `ok` |
+| 授权（两段式，推荐）| `GET /decision/start?timeout=N` → 轮询 `GET /decision/poll` | `decision [N]` | start→`ok`；poll→`pending`/`allow`/`deny`/`always`/`retry`/`none` |
+| 授权（阻塞，仅调试）| `GET /decision?timeout=N` | 同上 | 同上 |
 | 链路 | `GET /link`、`GET /link?mode=wifi\|ble` | `link [wifi\|ble]` | `link: wifi` / `ok link, restart in 1s` |
 
-`/task?text=...` 是 `POST /task` 的 URL 编码版。`decision` 的 N 上限 120 秒，
-不写默认 60；它会转黄灯并等掌机按键。`link` 不带参数是查询当前链路；带参数
-与设置菜单里「连接」那一项同义，**重启生效**——所以 WiFi 模式下切到蓝牙后
-先会失联，反过来蓝牙模式下切回 WiFi 也一样，等一秒重启即可。
+**多会话**：以上带状态的命令都可带槽参数——HTTP 加 `?s=N`（0..3），蓝牙在
+命令前加 `@N `（如 `@2 rojo`）。不带参数 = 槽 0，单会话语义不变。灯显示
+4 个槽的**聚合态**（黄>红>绿>灭），底部摘要每 4 秒轮播各槽任务；
+`/status` 逐槽列出 `s<N>: <state> <task>`。
+
+`/task?text=...` 是 `POST /task` 的 URL 编码版。`/question` 在授权界面上
+显示一行问句（工具 + 关键参数，≤40 字符），应在 `decision/start` 之前发。
+`decision` 的 N 上限 120 秒，不写默认 60；它会转黄灯并等掌机按键。
+`link` 不带参数是查询当前链路；带参数与设置菜单里「连接」那一项同义，
+**重启生效**——所以 WiFi 模式下切到蓝牙后先会失联，反过来蓝牙模式下
+切回 WiFi 也一样，等一秒重启即可。
 
 黄灯 30 秒无人理会会自动熄灭——但**有 decision 在等的时候不会**，
-否则用户还没走到掌机灯就没了。
+否则用户还没走到掌机灯就没了（请求超时后 pending 自动撤销，照常熄灭）。
 
-> ⚠️ `/decision` 会占住 httpd 整个等待期间（单 task），期间别的请求排队。
-> 实际用起来没问题：这时候 Claude Code 本来也卡在同一个授权上。
-> 蓝牙那条路不会：命令是丢给自己的 worker 任务跑的，不占 NimBLE 的 host task。
+> ⚠️ 阻塞版 `/decision` 会占住 httpd 整个等待期间（单 task），期间别的请求
+> 排队——多会话场景一律走两段式 start/poll（poll 是毫秒级请求）。
+> 蓝牙那条路不占：命令是丢给自己的 worker 任务跑的，不占 NimBLE 的 host task。
 
 蓝牙：设备名 `TLMIAO`，服务 `6d69616f-0001-4000-8000-00805f9b34fb`，
 RX（写）`…-0002-…`、TX（notify 回执）`…-0003-…`。UUID 在固件里是小端字节数组

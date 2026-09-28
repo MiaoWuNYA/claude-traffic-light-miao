@@ -54,24 +54,41 @@ bool lc_exec(const lc_host_t *h, const char *cmd, char *out, size_t osz) {
     char *verb = split_word(buf, &rest);
     if (!*verb) return false;
 
+    /* `@N ` 槽前缀：多会话（多开的几个 Claude）各自占一个槽。
+     * 没写前缀 = 槽 0，跟单会话时代的语义完全一样。 */
+    int slot = 0;
+    if (*verb == '@') {
+        slot = atoi(verb + 1);
+        if (slot < 0 || slot >= LC_SESS_MAX) {
+            snprintf(out, osz, "err slot 0..%d\n", LC_SESS_MAX - 1);
+            return true;
+        }
+        verb = split_word(&rest[0], &rest);
+        /* rest 已被 split_word 推进过一次，再切一次拿真正的动词 */
+        if (!*verb) return false;
+    }
+
     if (ieq(verb, "rojo") || ieq(verb, "red")) {
-        if (h->set_light) h->set_light(LC_RED);
+        if (h->set_light) h->set_light(slot, LC_RED);
         snprintf(out, osz, "ok rojo\n");
     } else if (ieq(verb, "alerta") || ieq(verb, "yellow")) {
-        if (h->set_light) h->set_light(LC_YELLOW);
+        if (h->set_light) h->set_light(slot, LC_YELLOW);
         snprintf(out, osz, "ok alerta\n");
     } else if (ieq(verb, "verde") || ieq(verb, "green")) {
-        if (h->set_light) h->set_light(LC_GREEN);
+        if (h->set_light) h->set_light(slot, LC_GREEN);
         snprintf(out, osz, "ok verde\n");
     } else if (ieq(verb, "off")) {
-        if (h->set_light) h->set_light(LC_OFF);
+        if (h->set_light) h->set_light(slot, LC_OFF);
         snprintf(out, osz, "ok off\n");
     } else if (ieq(verb, "status")) {
         const char *s = h->status ? h->status() : NULL;
         snprintf(out, osz, "state: %s\n", s ? s : "?");
     } else if (ieq(verb, "task")) {
-        if (h->set_task) h->set_task(rest);
+        if (h->set_task) h->set_task(slot, rest);
         snprintf(out, osz, "ok task\n");
+    } else if (ieq(verb, "question")) {
+        if (h->set_question) h->set_question(slot, rest);
+        snprintf(out, osz, "ok question\n");
     } else if (ieq(verb, "decision")) {
         int t = LC_DEC_TIMEOUT_DEFAULT;
         if (*rest) {
@@ -79,7 +96,7 @@ bool lc_exec(const lc_host_t *h, const char *cmd, char *out, size_t osz) {
             if (t < 1) t = 1;
             if (t > LC_DEC_TIMEOUT_MAX) t = LC_DEC_TIMEOUT_MAX;
         }
-        lc_dec_t d = h->wait_decision ? h->wait_decision(t) : LC_DEC_NONE;
+        lc_dec_t d = h->wait_decision ? h->wait_decision(slot, t) : LC_DEC_NONE;
         snprintf(out, osz, "%s\n", lc_dec_name(d));
     } else if (ieq(verb, "link")) {
         if (h->switch_link) snprintf(out, osz, "%s\n", h->switch_link(rest));

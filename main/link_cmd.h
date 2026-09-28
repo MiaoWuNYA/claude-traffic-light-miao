@@ -30,16 +30,20 @@ typedef enum {
     LC_DEC_RETRY,
 } lc_dec_t;
 
-/* 宿主（main.c）提供的动作。任何一项都可以为 NULL，lc_exec 会跳过。*/
+/* 宿主（main.c）提供的动作。任何一项都可以为 NULL，lc_exec 会跳过。
+ * 带会话槽的命令用 `@N ` 前缀（如 `@2 rojo`）；槽号作为第一个参数传进来，
+ * 没写前缀就是 0。 */
 typedef struct {
-    void      (*set_light)(lc_light_t st);
-    void      (*set_task)(const char *txt);
-    lc_dec_t  (*wait_decision)(int timeout_s);   /* 阻塞等掌机按键 */
-    const char *(*status)(void);                 /* 返回静态串，如 "rojo" */
+    void      (*set_light)(int slot, lc_light_t st);
+    void      (*set_task)(int slot, const char *txt);
+    void      (*set_question)(int slot, const char *txt); /* 授权问句，NULL=清空 */
+    lc_dec_t  (*wait_decision)(int slot, int timeout_s);   /* 阻塞等掌机按键 */
+    const char *(*status)(void);                 /* 返回聚合态名，如 "rojo" */
     const char *(*switch_link)(const char *arg); /* "wifi"/"ble"：切换链路并安排重启；
                                                     返回说明文字（复用为回执正文）*/
 } lc_host_t;
 
+#define LC_SESS_MAX 4
 #define LC_DEC_TIMEOUT_DEFAULT 60
 #define LC_DEC_TIMEOUT_MAX     120
 
@@ -48,10 +52,11 @@ typedef struct {
  * 返回 true  = 认出了这条命令，out 里有回执（成功或错误说明）。
  * 返回 false = 不认识的命令，out 未被改动。
  *
- * 识别的命令（与 HTTP API 同义）：
+ * 识别的命令（与 HTTP API 同义；均可带 `@N` 槽前缀）：
  *   rojo|red / alerta|yellow / verde|green / off
  *   status
  *   task <文本…>            （文本可含空格；空文本清空摘要）
+ *   question <文本…>        （授权问句；空文本清空）
  *   decision [秒]           （缺省 60，钳在 1..120）
  *   link wifi|ble           （切换链路模式，重启生效；缺省=读当前值）
  */
