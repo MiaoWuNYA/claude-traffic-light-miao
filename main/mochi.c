@@ -179,7 +179,10 @@ static void draw_face(mochi_state_t st) {
     if (st == MO_OFF) {                              /* 睡觉：闭眼弧 + zZ */
         arc_line(EYE_LX + EYE_W / 2, by + 12, 11, 200, 340, 1, face);
         arc_line(rx + EYE_W / 2, by + 12, 11, 200, 340, 1, face);
-        arc_line(W / 2, MOUTH_Y - 4, 5, 205, 335, 0, face);   /* 小平弧嘴 */
+        /* 睡觉嘴：r=5/thk=0 的"小平弧"实际画出来只有两个孤立像素点，
+         * 看着像嘴下面多了个"--"。改成向下弯的浅笑弧（弧心在上），
+         * 宽 20px、thk=1，和闭眼弧一个画法，看清是嘴。 */
+        arc_line(W / 2, 74, 12, 30, 150, 1, face);
         prop_sleeping();
         return;
     }

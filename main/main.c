@@ -788,7 +788,7 @@ static void screen_style(lv_obj_t *s) {
 
 static const char *state_text(light_t st) {
     switch (st) {
-    case ST_RED:    return "CLAUDE BUSY";
+    case ST_RED:    return "AGENT BUSY";
     case ST_YELLOW: return "NEEDS YOU !";
     case ST_GREEN:  return "TASK DONE";
     default:        return "OFF";
@@ -812,7 +812,7 @@ static void build_home(void) {
     /* cc-mochi 表情脸占全屏（画在背景层），label 叠在上面 */
     mochi_build(scr);
 
-    /* 状态字挪到左上：右上角要留给计时器，两者都居中的话「CLAUDE BUSY」
+    /* 状态字挪到左上：右上角要留给计时器，两者都居中的话「AGENT BUSY」
      * 会正好压到计时器上（160px 宽，14px 字已经占 ~108px）。*/
     s_lbl_state = mk_label(scr, "BOOT...", &lv_font_montserrat_14, UI_TEXT);
     lv_obj_align(s_lbl_state, LV_ALIGN_TOP_LEFT, 4, 5);
@@ -1452,7 +1452,7 @@ static void demo_run(void) {
         {  6000, EV_B|EV_LONG, NULL },          /* 长按B返回主界面 */
         {  8000, -1,         "1 主界面(熄灭)" },
         {  9000, EV_B,       NULL },            /* B = 红 */
-        { 10000, -1,         "2 红灯 CLAUDE BUSY" },
+        { 10000, -1,         "2 红灯 AGENT BUSY" },
         { 11000, EV_RIGHT,   NULL },            /* QEMU: RIGHT = 黄灯 */
         { 12000, -1,         "3 黄灯 NEEDS YOU" },
         { 13000, EV_UP|EV_LONG, NULL },         /* 长按进设置 → 扫描（短按会被"已连上"拦下）*/
