@@ -2073,22 +2073,27 @@ void app_main(void) {
         if (s_foot_show_ip && s_wifi_ok) {
             snprintf(want, sizeof want, "http://%s", s_ipbuf);
         } else {
-            /* 轮播优先级：黄 > 红 > 绿 > 灭；同轮内从上次槽的下一个找 */
+            /* 轮播优先级：黄 > 红 > 绿 > 灭；同轮内从上次槽的下一个找。
+             * 只轮播还活跃（非 off）的槽——off 的槽摘要保留着但不再显示，
+             * 否则全部会话结束后底部还在滚动最近一次的任务文本。 */
             static int rot = 0;
             static uint32_t rot_at = 0;
             const char *pick = s_wifi_ok ? "空闲中" : "未连接";
-            int n_any = 0;
             if (lv_tick_get() - rot_at >= 4000) {
                 rot_at = lv_tick_get();
                 for (int k = 0; k < SESS_MAX; k++) {
                     int i = (rot + 1 + k) % SESS_MAX;
-                    if (s_sessions[i].task[0]) { rot = i; n_any++; break; }
-                    if (s_sessions[i].st != ST_OFF) n_any++;
+                    if (s_sessions[i].st != ST_OFF && s_sessions[i].task[0]) {
+                        rot = i;
+                        break;
+                    }
                 }
             }
-            if (s_sessions[rot].task[0]) pick = s_sessions[rot].task;
-            else if (rot != 0) { rot = 0; pick = s_sessions[0].task; }
-            (void)n_any;
+            if (s_sessions[rot].st != ST_OFF && s_sessions[rot].task[0])
+                pick = s_sessions[rot].task;
+            else if (rot != 0) {
+                rot = 0;    /* 回到槽 0 待命，下次有活跃槽从它附近找 */
+            }
             strlcpy(want, pick[0] ? pick : (s_wifi_ok ? "空闲中" : "未连接"),
                     sizeof want);
         }
