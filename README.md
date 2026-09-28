@@ -131,6 +131,8 @@ QEMU 的 esp32 机型**没有 WiFi 基带模型**（调 esp_wifi 直接 abort）
 
 已经配好了（`~/.claude/settings.json` + `~/.claude/hooks/traffic-light.py`）：
 
+钩子脚本在仓库里的 [`host/traffic-light.py`](host/traffic-light.py)（纯 Python 标准库，BLE 路径依赖 bleak）。
+
 | 事件 | 灯 |
 |------|----|
 | UserPromptSubmit | 红（顺带把用户输入推到设备底部当摘要）|
@@ -156,7 +158,7 @@ QEMU 的 esp32 机型**没有 WiFi 基带模型**（调 esp_wifi 直接 abort）
 ~/.claude/hooks/traffic-light.py task 改菜单 # 手动推一条任务摘要
 ```
 
-换到别的机器上部署，只需拷贝 `traffic-light.py` 并照上表加 hooks 即可。
+换到别的机器上部署，只需拷贝 `host/traffic-light.py` 并照上表加 hooks 即可。
 
 ### 在掌机上做授权决定
 
