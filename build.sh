@@ -8,8 +8,23 @@
 set -e
 cd "$(dirname "$0")"
 
-export IDF_PATH="$HOME/Documents/喵claude/repos/esp-idf"
-PY="$HOME/.espressif/python_env/idf5.5_py3.12_env/bin/python"
+# IDF_PATH / IDF_PYTHON 可以外部覆盖，换机器或者装到别处就不用改脚本
+IDF_PATH="${IDF_PATH:-$HOME/Documents/喵claude/repos/esp-idf}"
+PY="${IDF_PYTHON:-$HOME/.espressif/python_env/idf5.5_py3.12_env/bin/python}"
+
+if [ ! -f "$IDF_PATH/export.sh" ]; then
+    echo "找不到 ESP-IDF：$IDF_PATH" >&2
+    echo "用 IDF_PATH=/path/to/esp-idf ./build.sh 指定" >&2
+    exit 1
+fi
+
+if [ ! -x "$PY" ]; then
+    echo "找不到 IDF 的 python：$PY" >&2
+    echo "用 IDF_PYTHON=/path/to/python ./build.sh 指定" >&2
+    exit 1
+fi
+
+export IDF_PATH
 # shellcheck disable=SC1091
 source "$IDF_PATH/export.sh" > /dev/null
 
